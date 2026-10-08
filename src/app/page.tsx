@@ -49,6 +49,11 @@ export default function HomePage() {
   const [joinError, setJoinError] = useState('')
 
   const [userName, setUserName] = useState('')
+  const [userId, setUserId] = useState<string | null>(null)
+  const [homeTab, setHomeTab] = useState<'play' | 'history'>('play')
+  const [myGames, setMyGames] = useState<Array<{ id: string; code: string; name: string; status: string; created_at?: string }>>([])
+  const [historyLoading, setHistoryLoading] = useState(false)
+  const [historyRefresh, setHistoryRefresh] = useState(0)
   const [loadingUser, setLoadingUser] = useState(true)
 
   useEffect(() => {
@@ -58,6 +63,7 @@ export default function HomePage() {
       } = await supabase.auth.getUser()
 
       if (user) {
+        setUserId(user.id)
         setUserName(
           user.user_metadata?.full_name ||
             user.user_metadata?.name ||
@@ -71,6 +77,39 @@ export default function HomePage() {
 
     loadUser()
   }, [])
+
+  useEffect(() => {
+    if (!userId) return
+    let cancelled = false
+    async function loadMyGames() {
+      setHistoryLoading(true)
+      try {
+        const { data: memberships, error: membershipError } = await supabase
+          .from('game_players')
+          .select('game_id')
+          .eq('user_id', userId)
+        if (membershipError) throw membershipError
+        const gameIds = [...new Set((memberships ?? []).map((row) => row.game_id))]
+        if (gameIds.length === 0) {
+          if (!cancelled) setMyGames([])
+          return
+        }
+        const { data, error } = await supabase
+          .from('games')
+          .select('id, code, name, status, created_at')
+          .in('id', gameIds)
+          .order('created_at', { ascending: false })
+        if (error) throw error
+        if (!cancelled) setMyGames(data ?? [])
+      } catch (err) {
+        console.error('Load game history error:', err)
+      } finally {
+        if (!cancelled) setHistoryLoading(false)
+      }
+    }
+    loadMyGames()
+    return () => { cancelled = true }
+  }, [userId, historyRefresh])
 
   const customHappenings = useMemo(() => {
     return customText
@@ -89,8 +128,11 @@ export default function HomePage() {
       )
     ).size
 
+  const customBoardSize = Math.sqrt(customCount)
+  const customIsPerfectSquare = customCount >= 1 && Number.isInteger(customBoardSize)
+
   const customIsValid =
-    customCount === 25 &&
+    customIsPerfectSquare &&
     duplicateCount === 0 &&
     customHappenings.every(
       (item) => item.length >= 1 && item.length <= 100
@@ -131,9 +173,9 @@ export default function HomePage() {
       if (gameMode === 'quick') {
         happeningsToUse = HAPPENINGS
       } else {
-        if (customCount !== 25) {
+        if (!customIsPerfectSquare) {
           throw new Error(
-            `Custom Bingo needs exactly 25 happenings. You currently have ${customCount}.`
+            `Choose a perfect-square number of happenings (9, 16, 25, 36, etc.). You currently have ${customCount}.`
           )
         }
 
@@ -224,10 +266,10 @@ export default function HomePage() {
 
       if (
         !happeningsData ||
-        happeningsData.length !== 25
+        happeningsData.length !== happeningsToUse.length
       ) {
         throw new Error(
-          'Failed to create all 25 happenings.'
+          'Failed to create all happenings.'
         )
       }
 
@@ -377,10 +419,10 @@ export default function HomePage() {
 
         if (
           !happenings ||
-          happenings.length !== 25
+          happenings.length < 1 || !Number.isInteger(Math.sqrt(happenings.length))
         ) {
           throw new Error(
-            'This game does not have the expected 25 happenings.'
+            'This game does not have a valid square-sized board.'
           )
         }
 
@@ -576,6 +618,17 @@ export default function HomePage() {
         {/* MAIN */}
         {userName && (
           <>
+            <div className="mb-6 flex gap-2 rounded-2xl border border-gray-800 bg-gray-900/80 p-1">
+              <button type="button" onClick={() => setHomeTab('play')} className={`flex-1 rounded-xl px-4 py-3 text-sm font-bold transition ${homeTab === 'play' ? 'bg-green-500 text-gray-950' : 'text-gray-400 hover:text-white'}`}>🎮 Create / Join</button>
+              <button type="button" onClick={() => setHomeTab('history')} className={`flex-1 rounded-xl px-4 py-3 text-sm font-bold transition ${homeTab === 'history' ? 'bg-green-500 text-gray-950' : 'text-gray-400 hover:text-white'}`}>📚 My Games</button>
+            </div>
+
+            {homeTab === 'history' ? (
+              <section className="rounded-3xl border border-gray-800 bg-gray-900/90 p-6 shadow-xl sm:p-8">
+                <div className="mb-6 flex items-center justify-between gap-3"><div><h3 className="text-2xl font-bold">My Games</h3><p className="mt-1 text-sm text-gray-500">Reopen games you have joined, whether active or finished.</p></div><button type="button" onClick={() => setHistoryRefresh((value) => value + 1)} className="rounded-lg bg-gray-800 px-3 py-2 text-xs font-bold text-gray-300 hover:bg-gray-700">Refresh</button></div>
+                {historyLoading ? <p className="py-10 text-center text-sm text-gray-500">Loading your games…</p> : myGames.length === 0 ? <div className="rounded-2xl border border-dashed border-gray-700 px-5 py-12 text-center"><p className="font-bold text-gray-300">No games yet</p><p className="mt-2 text-sm text-gray-500">Games you create or join will appear here.</p><button type="button" onClick={() => setHomeTab('play')} className="mt-4 rounded-xl bg-green-500 px-4 py-2 font-bold text-gray-950">Create your first game</button></div> : <div className="space-y-3">{myGames.map((item) => <div key={item.id} className="flex flex-col gap-3 rounded-2xl border border-gray-800 bg-gray-950/70 p-4 sm:flex-row sm:items-center sm:justify-between"><div className="min-w-0"><div className="flex flex-wrap items-center gap-2"><h4 className="font-bold text-white">{item.name}</h4><span className={`rounded-full px-2 py-1 text-[10px] font-black uppercase ${item.status === 'finished' ? 'bg-yellow-500/10 text-yellow-300' : item.status === 'active' ? 'bg-green-500/10 text-green-300' : 'bg-blue-500/10 text-blue-300'}`}>{item.status}</span></div><p className="mt-1 text-xs text-gray-500">Code: <span className="font-mono tracking-widest">{item.code}</span>{item.created_at ? ` · ${new Date(item.created_at).toLocaleDateString()}` : ''}</p></div><a href={`/game/${item.code}`} className="rounded-xl bg-gray-800 px-4 py-2.5 text-center text-sm font-bold text-white transition hover:bg-gray-700">Open game →</a></div>)}</div>}
+              </section>
+            ) : (
             <div className="grid gap-5 lg:grid-cols-[1.15fr_0.85fr]">
 
               {/* CREATE */}
@@ -683,12 +736,12 @@ export default function HomePage() {
                         </p>
 
                         <p className="mt-1 text-xs text-gray-600">
-                          Your default 25 happenings
+                          Your default ${HAPPENINGS.length} happenings
                         </p>
                       </div>
 
                       <div className="rounded-full bg-green-500/10 px-3 py-1 text-xs font-black text-green-400">
-                        25 / 25
+                        {HAPPENINGS.length} / {HAPPENINGS.length}
                       </div>
 
                     </div>
@@ -710,12 +763,12 @@ export default function HomePage() {
                         className={`text-xs font-bold ${
                           customIsValid
                             ? 'text-green-400'
-                            : customCount > 25
+                            : !customIsPerfectSquare && customCount > 0
                               ? 'text-red-400'
                               : 'text-gray-500'
                         }`}
                       >
-                        {customCount} / 25
+                        {customCount} happenings
                       </span>
 
                     </div>
@@ -741,8 +794,7 @@ Someone tells a story
                     <div className="mt-2 flex items-center justify-between gap-3">
 
                       <p className="text-xs leading-relaxed text-gray-600">
-                        Enter one happening per line.
-                        Each one should be unique.
+                        Enter one happening per line. Use a perfect-square total (9, 16, 25, 36, etc.). Each one should be unique.
                       </p>
 
                       <button
@@ -766,10 +818,10 @@ Someone tells a story
                       </div>
                     )}
 
-                    {customCount === 25 &&
+                    {customIsPerfectSquare &&
                       duplicateCount === 0 && (
                         <div className="mt-3 rounded-xl border border-green-900 bg-green-950/30 px-3 py-2 text-xs font-semibold text-green-400">
-                          ✓ Your custom Bingo is ready.
+                          ✓ Your {customCount}-square Bingo is ready ({customBoardSize} × {customBoardSize}).
                         </div>
                       )}
 
@@ -955,7 +1007,9 @@ Someone tells a story
               </section>
 
             </div>
+            )}
 
+            {homeTab === 'play' && (<>
             {/* HOW IT WORKS */}
             <section className="mt-14">
 
@@ -1028,6 +1082,7 @@ Someone tells a story
               </div>
 
             </section>
+            </>)}
           </>
         )}
 

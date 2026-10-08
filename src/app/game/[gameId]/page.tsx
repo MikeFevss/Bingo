@@ -48,22 +48,18 @@ type Line = number[]
 
 const supabase = createClient()
 
-const WINNING_LINES: Line[] = [
-  [0, 1, 2, 3, 4],
-  [5, 6, 7, 8, 9],
-  [10, 11, 12, 13, 14],
-  [15, 16, 17, 18, 19],
-  [20, 21, 22, 23, 24],
-
-  [0, 5, 10, 15, 20],
-  [1, 6, 11, 16, 21],
-  [2, 7, 12, 17, 22],
-  [3, 8, 13, 18, 23],
-  [4, 9, 14, 19, 24],
-
-  [0, 6, 12, 18, 24],
-  [4, 8, 12, 16, 20],
-]
+function getWinningLines(size: number): Line[] {
+  const lines: Line[] = []
+  for (let row = 0; row < size; row++) {
+    lines.push(Array.from({ length: size }, (_, col) => row * size + col))
+  }
+  for (let col = 0; col < size; col++) {
+    lines.push(Array.from({ length: size }, (_, row) => row * size + col))
+  }
+  lines.push(Array.from({ length: size }, (_, i) => i * size + i))
+  lines.push(Array.from({ length: size }, (_, i) => i * size + (size - 1 - i)))
+  return lines
+}
 
 function getBestLineProgress(
   board: string[],
@@ -72,7 +68,10 @@ function getBestLineProgress(
   let bestLine: Line = []
   let bestCount = 0
 
-  for (const line of WINNING_LINES) {
+  const size = Math.sqrt(board.length)
+  if (!Number.isInteger(size) || size < 1) return { count: 0, line: [] as Line }
+
+  for (const line of getWinningLines(size)) {
     const count = line.filter((index) =>
       checkedIds.has(board[index])
     ).length
@@ -370,10 +369,10 @@ export default function GamePage({
 
           if (
             !gameHappenings ||
-            gameHappenings.length !== 25
+            gameHappenings.length < 1 || !Number.isInteger(Math.sqrt(gameHappenings.length))
           ) {
             throw new Error(
-              'This game does not have a valid 25-square board.'
+              'This game does not have a valid square-sized board.'
             )
           }
 
@@ -777,30 +776,21 @@ export default function GamePage({
       .on(
         'postgres_changes',
         {
-          event: 'INSERT',
+          event: '*',
           schema: 'public',
           table: 'checked_happenings',
           filter: `game_id=eq.${gameId}`,
         },
         (payload) => {
-          const happeningId =
-            payload.new
-              ?.happening_id
-
-          if (!happeningId) {
-            return
-          }
-
-          setCheckedIds(
-            (previous) => {
-              const next =
-                new Set(previous)
-
-              next.add(happeningId)
-
-              return next
-            }
-          )
+          const row = (payload.eventType === 'DELETE' ? payload.old : payload.new) as { happening_id?: string }
+          const happeningId = row?.happening_id
+          if (!happeningId) return
+          setCheckedIds((previous) => {
+            const next = new Set(previous)
+            if (payload.eventType === 'DELETE') next.delete(happeningId)
+            else next.add(happeningId)
+            return next
+          })
         }
       )
 
@@ -1017,74 +1007,41 @@ export default function GamePage({
     await loadGame()
   }
 
-  const checkHappening = async (
-    happeningId: string
-  ) => {
-    if (
-      !game ||
-      game.status !== 'active' ||
-      !currentPlayer
-    ) {
-      return
-    }
+  const checkHappening = async (happeningId: string) => {
+    if (!game || game.status !== 'active' || !currentPlayer || game.winner_id) return
 
-    if (
-      checkedIds.has(happeningId)
-    ) {
-      return
-    }
+    const happening = happenings.find((item) => item.id === happeningId)
+    const playerName = currentPlayer.display_name || userName || 'Player'
 
-    const {
-      error: insertError,
-    } = await supabase
-      .from('checked_happenings')
-      .insert({
-        game_id: game.id,
-        happening_id:
-          happeningId,
-        checked_by:
-          currentUserId,
-      })
-
-    if (insertError) {
-      console.error(
-        'Check happening error:',
-        insertError
-      )
-
-      return
-    }
-
-    const happening =
-      happenings.find(
-        (item) =>
-          item.id ===
-          happeningId
-      )
-
-    setCheckedIds(
-      (previous) => {
-        const next =
-          new Set(previous)
-
-        next.add(happeningId)
-
-        return next
+    if (checkedIds.has(happeningId)) {
+      const { error: deleteError } = await supabase
+        .from('checked_happenings')
+        .delete()
+        .eq('game_id', game.id)
+        .eq('happening_id', happeningId)
+      if (deleteError) {
+        console.error('Uncheck happening error:', deleteError)
+        return
       }
-    )
-
-    if (happening) {
-      const playerName =
-        currentPlayer.display_name ||
-        userName ||
-        'Player'
-
-      await addActivity(
-        'check',
-        `☑️ ${playerName} checked "${happening.text}"`,
-        happeningId
-      )
+      setCheckedIds((previous) => {
+        const next = new Set(previous)
+        next.delete(happeningId)
+        return next
+      })
+      if (happening) await addActivity('uncheck', `↩️ ${playerName} unchecked "${happening.text}"`, happeningId)
+      return
     }
+
+    const { error: insertError } = await supabase
+      .from('checked_happenings')
+      .insert({ game_id: game.id, happening_id: happeningId, checked_by: currentUserId })
+    if (insertError) {
+      // Another player may have checked the same square at the same time.
+      if (!String(insertError.code).includes('23505')) console.error('Check happening error:', insertError)
+      return
+    }
+    setCheckedIds((previous) => new Set(previous).add(happeningId))
+    if (happening) await addActivity('check', `☑️ ${playerName} checked "${happening.text}"`, happeningId)
   }
 
   useEffect(() => {
@@ -1113,7 +1070,7 @@ export default function GamePage({
         checkedIds
       )
 
-    if (progress.count !== 5) {
+    if (progress.count !== Math.sqrt(currentPlayer.board.length)) {
       return
     }
 
@@ -1424,6 +1381,8 @@ export default function GamePage({
   const totalHappenings =
     happenings.length
 
+  const boardSize = currentPlayer ? Math.sqrt(currentPlayer.board.length) : Math.sqrt(happenings.length || 25)
+
   const currentProgress =
     currentPlayer
       ? getBestLineProgress(
@@ -1636,7 +1595,7 @@ export default function GamePage({
               {winnerProgress && (
                 <p className="mt-2 text-sm text-yellow-200/80">
                   Winning line:{' '}
-                  {winnerProgress.count}/5
+                  {winnerProgress.count}/{Math.sqrt(winnerPlayer.board.length)}
                 </p>
               )}
             </section>
@@ -1725,7 +1684,7 @@ export default function GamePage({
                       : []
 
                 const isOneAway =
-                  progress.count === 4
+                  progress.count === Math.sqrt(player.board.length) - 1
 
                 return (
                   <div
@@ -1768,7 +1727,7 @@ export default function GamePage({
                         </div>
 
                         <div className="mt-1 text-xs text-slate-500">
-                          {progress.count}/5 on best line
+                          {progress.count}/{player.board.length ? Math.sqrt(player.board.length) : 5} on best line
                         </div>
                       </div>
 
@@ -1783,7 +1742,7 @@ export default function GamePage({
                           </div>
                         ) : (
                           <div className="text-sm font-bold text-slate-400">
-                            {progress.count}/5
+                            {progress.count}/{Math.sqrt(player.board.length)}
                           </div>
                         )}
                       </div>
@@ -1802,7 +1761,7 @@ export default function GamePage({
                         style={{
                           width: `${
                             (progress.count /
-                              5) *
+                              Math.sqrt(player.board.length)) *
                             100
                           }%`,
                         }}
@@ -1810,7 +1769,7 @@ export default function GamePage({
                     </div>
 
                     {/* BOARD */}
-                    <div className="mx-auto grid w-full max-w-[560px] grid-cols-5 gap-1.5 sm:gap-2">
+                    <div className="mx-auto grid w-full max-w-[560px] gap-1.5 sm:gap-2" style={{ gridTemplateColumns: `repeat(${Math.sqrt(player.board.length)}, minmax(0, 1fr))` }}>
                       {player.board.map(
                         (
                           happeningId,
@@ -1870,7 +1829,7 @@ export default function GamePage({
                           } else if (
                             highlighted &&
                             progress.count >=
-                              3
+                              Math.max(2, Math.sqrt(player.board.length) - 2)
                           ) {
                             squareClass =
                               'border-blue-300/70 bg-blue-400/20 text-blue-100'
@@ -1954,8 +1913,7 @@ export default function GamePage({
                   </h2>
 
                   <p className="text-sm text-slate-400">
-                    Tap a happening to check it for
-                    everyone.
+                    Tap a square to check or uncheck it for everyone.
                   </p>
                 </div>
 
@@ -1963,25 +1921,25 @@ export default function GamePage({
                   <div
                     className={`text-sm font-black ${
                       currentProgress.count ===
-                      4
+                      Math.sqrt(currentPlayer.board.length) - 1
                         ? 'text-orange-300'
                         : currentProgress.count >=
-                            3
+                            Math.max(2, Math.sqrt(currentPlayer.board.length) - 2)
                           ? 'text-blue-300'
                           : 'text-slate-400'
                     }`}
                   >
                     Best line:{' '}
                     {currentProgress.count}
-                    /5
+                    /{Math.sqrt(currentPlayer.board.length)}
                     {currentProgress.count ===
-                      4 &&
+                      Math.sqrt(currentPlayer.board.length) - 1 &&
                       ' — ONE AWAY!'}
                   </div>
                 )}
               </div>
 
-              <div className="mx-auto grid w-full max-w-[700px] grid-cols-5 gap-1.5 sm:gap-2">
+              <div className="mx-auto grid w-full max-w-[700px] gap-1.5 sm:gap-2" style={{ gridTemplateColumns: `repeat(${boardSize}, minmax(0, 1fr))` }}>
                 {currentPlayer.board.map(
                   (
                     happeningId,
@@ -2015,7 +1973,7 @@ export default function GamePage({
                     if (
                       highlighted &&
                       currentProgress?.count ===
-                        4 &&
+                        Math.sqrt(currentPlayer.board.length) - 1 &&
                       !checked
                     ) {
                       buttonClass =
@@ -2026,18 +1984,13 @@ export default function GamePage({
                       <button
                         key={happeningId}
                         type="button"
-                        disabled={
-                          checked
-                        }
                         onClick={() =>
                           checkHappening(
                             happeningId
                           )
                         }
                         className={`relative flex min-h-[70px] items-center justify-center rounded-xl border p-2 text-center transition active:scale-95 sm:min-h-[88px] ${buttonClass} ${
-                          checked
-                            ? 'cursor-default'
-                            : 'cursor-pointer'
+                          'cursor-pointer'
                         }`}
                       >
                         {checked && (
